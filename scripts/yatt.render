@@ -1,0 +1,62 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings FATAL => qw(all);
+
+use FindBin;
+use lib grep(-d
+	     , "$FindBin::Script.lib", "$FindBin::RealScript.lib"
+	     , "$FindBin::Bin/yatt.lib", "$FindBin::Bin/lib"
+	     , grep {defined} $ENV{YATT_LIB});
+
+use File::Basename;
+
+use YATT::Inc;
+use YATT::Toplevel::CGI qw(*CGI);
+use base qw(YATT::Toplevel::CGI);
+sub MY () { __PACKAGE__ }
+
+MY->parse_opts(\@ARGV, \ my %opts);
+MY->parse_params(\@ARGV, \ my %common);
+
+my $config = MY->new_config(%opts);
+
+my ($rootdir, $top) = do {
+  my $file = $ARGV[0]; # Keep original.
+
+  unless (defined $file and -r $file) {
+    die "Usage: $0 file ?name=value ...?\n"
+  }
+
+  my $dir = dirname(MY->rel2abs($file));
+  $config->try_load_config($dir);
+
+  # XXX: テンプレートディレクトリの指定も。
+  ($dir
+   , MY->new_translator([DIR => $dir], $config->translator_param
+			, debug_translator => $ENV{DEBUG}));
+};
+
+# [1] Compile all.
+my @command;
+{
+  while (@ARGV) {
+    my $file = shift @ARGV;
+    my %param = %common;
+    MY->parse_params(\@ARGV, \%param);
+
+    # XXX: render 以外も。
+    my ($handler, $pkg, $widget) = $top->get_handler_to
+      (render => MY->widget_path_in($rootdir, MY->rel2abs($file)));
+    push @command, [$handler, $pkg, scalar $widget->reorder_params(\%param)];
+  }
+}
+
+# [2] Execute all.
+
+foreach my $cmd (@command) {
+  my ($sub, @args) = @$cmd;
+  local $ENV{REQUEST_METHOD} = 'GET';
+  local $CGI = MY->new_cgi();
+  # XXX: die handler.
+  $sub->(@args);
+}
