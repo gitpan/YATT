@@ -2,7 +2,7 @@
 package YATT::LRXML::EntityPath;
 use strict;
 use warnings FATAL => qw(all);
-use Exporter qw(import);
+BEGIN {require Exporter; *import = \&Exporter::import}
 our @EXPORT_OK = qw(parse_entpath is_nested_entpath);
 our @EXPORT = @EXPORT_OK;
 
@@ -15,19 +15,21 @@ our @EXPORT = @EXPORT_OK;
   trail    ::= var | '[' term ']' ;
 
   container::= '[' term* ']'
-             |  '{' ( name (':' | '=') term )* '}' ;
+             |  '{' ( dot_name (':' text | '=' term )
+                    | other+ ','?
+                    )* '}' ;
 
   var      ::= (':'+ | '.'+) name ( '(' term* ')' )? ;
   name     ::= \w+ ;
+  dot_name ::= [\w\.]+ ;
 
   expr     ::= '=' text ;
   text     ::= word ( group word? )* ; -- group で始まるのは、container.
 
   group    ::= [\(\[\{] ( text | ',' )* [\}\]\)]
 
-  word     ::= [\w\$\-\+\*/%<>]
-               [\w\$\-\+\*/%<>:\.=]*
-           ;
+  word     ::= [\w\$\-\+\*/%<>] other* ;
+  other    ::= [\w\$\-\+\*/%<>:\.!=] ;
 
 =cut
 
@@ -41,10 +43,27 @@ sub is_nested_entpath {
   defined $item->[0][0] and $item->[0][0] eq $_[0];
 }
 
+our ($TRANS, $NODE, $ORIG);
+
+sub mydie (@) {
+  my $fmt = shift;
+  my $diag = do {
+    if ($TRANS and $NODE) {
+      $TRANS->node_error($NODE, $fmt, @_);
+    } else {
+      sprintf $fmt, @_;
+    };
+  };
+  die $diag;
+}
+
 sub parse_entpath {
-  my ($pack, $orig) = @_;
+  my ($pack, $orig, $trans, $node) = @_;
   return undef unless defined $orig;
   local $_ = $orig;
+  local $ORIG = $orig;
+  local $TRANS = $trans;
+  local $NODE = $node;
   my @result;
   if (wantarray) {
     @result = &_parse_pipeline;
@@ -52,7 +71,7 @@ sub parse_entpath {
     $result[0] = &_parse_pipeline;
   }
   if ($_ ne '') {
-    die "Unexpected token '$_' in entpath '$orig'";
+    mydie "Unexpected token '$_' in entpath '$orig'";
   }
   wantarray ? @result : $result[0];
 }
@@ -61,9 +80,9 @@ my %open_head = qw| ( call [ array { hash |;
 my %open_rest = qw| ( call [ aref  |;
 my %close_ch  = qw( ( ) [ ] { } );
 
-my $re_var  = qr{[:\.]+ (\w+) (\()?}x;
-my $re_word = qr{[\w\$\-\+\*/%<>]
-		 [\w\$\-\+\*/%<>:\.=]*}x;
+my $re_var  = qr{[:]+ (\w+) (\()?}x;
+my $re_other= qr{[\w\$\-\+\*/%<>\.=\@!:]}x;
+my $re_word = qr{[\w\$\-\+\*/%<>\.=\@] $re_other*}x;
 
 sub _parse_pipeline {
   my @pipe;
@@ -73,8 +92,7 @@ sub _parse_pipeline {
   } elsif (s/^ \{ //x) {
     push @pipe, &_parse_hash;
   }
-  if (s/^$re_var//x) {
-    do {
+  while (s/^$re_var | ^(\[) | ^(\{)//x) {
       if ($2) {
 	# '('
 	push @pipe, _parse_group([call => $1], ')', \&_parse_term);
@@ -86,9 +104,8 @@ sub _parse_pipeline {
       } elsif (defined $4) {
 	push @pipe, _parse_group(['var'], '}', \&_parse_term);
       } else {
-	die "?? $_";
+	mydie "?? $_";
       }
-    } while s/^$re_var | ^(\[) | ^(\{)//x;
   }
   wantarray ? @pipe : \@pipe;
 }
@@ -112,9 +129,12 @@ sub _parse_term {
   if (s{^,}{}x) {
     return [$literal_type => ''];
   }
-  my $is_expr = s{^=}{};
+  if (my $is_expr = s{^=}{}) {
+    return &_parse_expr;
+  }
+  my @result;
   unless (s{^$re_text}{}) {
-    &_parse_pipeline;
+    @result = &_parse_pipeline;
   } else {
     my $result = '';
   TEXT: {
@@ -130,21 +150,45 @@ sub _parse_term {
 	}
       } while s{^(?: $re_text | ([\(\[\{]) | ([:\.]) ) }{}x;
     }
-    s/^,//;
-    [$is_expr ? 'expr' : $literal_type => $result];
+    @result = [$literal_type => $result];
   }
+  s/^,//;
+  @result;
+}
+
+sub _parse_expr {
+  my $literal_type = 'expr';
+  if (s{^,}{}x) {
+    return [$literal_type => ''];
+  }
+  my $result = '';
+ TEXT:
+  while (s{^(?: $re_text | ([\(\[\{]) | ([:\.]) ) }{}x) {
+    $result .= $1 if defined $1;
+    $result .= $4 if defined $4;
+    if (my $opn = $2 || $3) {
+      # open group
+      $result .= $opn;
+      $result .= &_parse_group_string($close_ch{$opn});
+    } elsif (not defined $1 and not defined $4) {
+      last TEXT;
+    }
+  }
+  s/^,//;
+  [$literal_type => $result];
 }
 
 sub _parse_group {
   my ($group, $close, $sub, @rest) = @_;
   for (my ($len, $cnt) = length($_); $_ ne ''; $len = length($_), $cnt++) {
     if (s/^ ([\)\]\}])//x) {
-      die "Paren mismatch: expect $close got $1 " if $1 ne $close;
-      s/^,//;
+      mydie "Paren mismatch: expect $close got $1 " if $1 ne $close;
       last;
     }
     my @pipe = $sub->(@rest);
-    die "Can't match: $_" if $cnt && $len == length($_);
+    if ($cnt && $len == length($_)) {
+      mydie "Can't match: $_" . (defined $close ? " for $close" : "");
+    }
     push @$group, @pipe <= 1 ? @pipe : \@pipe;
   }
   $group;
@@ -153,16 +197,21 @@ sub _parse_group {
 sub _parse_group_string {
   my ($close) = @_;
   my $result = '';
-  for (my $len = length($_); $_ ne ''; $len = length($_)) {
+  for (my ($len, $prev) = length($_); $_ ne ''
+       ; $prev = $len, $len = length($_)) {
     if (s/^ ([\)\]\}])//x) {
-      die "Paren mismatch: expect $close got $1 " if $1 ne $close;
+      mydie "Paren mismatch: expect $close got $1 " if $1 ne $close;
       $result .= $1;
       last;
     }
     if (s/^($re_word | , )//x) {
       $result .= $1;
     } elsif (s/^([\(\[\{])//) {
+      $result .= $1;
       $result .= &_parse_group_string($close_ch{$1});
+    }
+    if (defined $prev and $prev == length($_)) {
+      mydie "Can't parse entity_path group $ORIG (near $_)\n"
     }
   }
   $result;
@@ -172,17 +221,23 @@ sub _parse_hash {
   my @hash = ('hash');
   for (my ($len, $cnt) = length($_); $_ ne ''; $len = length($_), $cnt++) {
     if (s/^ ([\)\]\}])//x) {
-      die "Paren mismatch: expect \} got $1 " if $1 ne '}';
-      s/^,//;
+      mydie "Paren mismatch: expect \} got $1 " if $1 ne '}';
       last;
     }
-    if ($cnt && $len == length($_)) {
-      die "Can't parse: $_"
+    # {!=,:var} を許すには…
+    if (s/^([\w\.\-]+) [:=] //x || s/^($re_other+) ,?//x) {
+      # ↑ array でも許すべきか?
+      my $str = $1;
+      push @hash, [$str =~ s/^:// ? 'var' : 'text', $str];
     }
-    s/^,//;
-    s/^(\w+) [:=] //x or die "Hash key is missing: $_";
-    push @hash, [text => $1], &_parse_term;
+    my @value = &_parse_term;
+    push @hash, @value > 1 ? \@value : $value[0];
+    unless (length($_) < $len) {
+      mydie "Infinite loop on parse_hash: $_";
+    }
   }
+  # XXX: Give more detailed diag!
+  mydie "Odd number of hash elements" if (@hash - 1) % 2;
   \@hash;
 }
 

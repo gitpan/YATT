@@ -2,19 +2,17 @@
 # -*- mode: perl; coding: utf-8 -*-
 use strict;
 use warnings FATAL => qw(all);
-use Test::More no_plan => 1;
-use Test::Differences;
+use Test::More qw(no_plan);
 
 use FindBin;
 use lib "$FindBin::Bin/..";
 
 use YATT;
+use YATT::Test;
 use YATT::LRXML::Node qw(TEXT_TYPE);
+require YATT::Test;
 
 use Data::Dumper;
-sub dumper {
-  Data::Dumper->new(\@_)->Terse(1)->Indent(0)->Dump;
-}
 
 require_ok('YATT::LRXML::Parser');
 YATT::break_parser;
@@ -322,12 +320,17 @@ END
     = q{<yatt:foo
 &yatt:var;
 my:foo
-my:bar='BAR'
-><:yatt:baz>BAZ</:yatt:baz>bang</yatt:foo>};
+my:bar='BAR'><:yatt:baz>BAZ</:yatt:baz>bang</yatt:foo>};
+
+  # XXX: Currently, \n in tag is not preserved.
+  $html =~ s{\n}{ }g;
+
   my $elem = $parser->parse_string($html)->open;
   is_deeply [$elem->node_name, $elem->node_path], [qw(foo
 						      yatt foo)]
     , 'name of elem';
+
+  eq_or_diff $elem->stringify, $html, "round trip of my";
 
   my $att = $elem->open;
   is_deeply [scalar $att->node_name, do {
@@ -356,4 +359,26 @@ if (0)
 
 #  print YATT::Translator::JavaScript->new($tree)
 #    ->translate_as_function('index');
+}
+
+{
+  my $src3 = <<'END';
+<h2>&yatt:file(=@$_);</h2>
+END
+
+  my $tree = read_string YATT::LRXML($src3, filename => $0);
+  print Dumper($tree) if $ENV{DEBUG};
+
+  is $tree->size, 3, 'LRXML is correctly parsed';
+
+  eq_or_diff $tree->stringify, $src3, 'LRXML round trip';
+}
+
+{
+  # missing close tag.
+  my $parser = new YATT::LRXML::Parser;
+  my $html = q{<yatt:foo>bar};
+
+  YATT::Test::raises([$parser => parse_string => $html]
+		     , qr{^Missing close tag 'foo'}, "missing close tag");
 }

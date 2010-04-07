@@ -143,9 +143,14 @@ push our \@EXPORT, qw($aliases);
 END
 
   my $stash = *{globref($$opts{cf_callpack}, '')}{HASH};
+  print STDERR "# [$$opts{cf_callpack} has] "
+    , join(" ", sort keys %$stash), "\n"
+      if $opts->{cf_debug};
   foreach my $classdef (@{$$opts{classes}}, @{$$opts{aliases}}) {
     # Ignore if alias is already defined.
-    next if exists $stash->{$classdef->[0]};
+    my $entry = $stash->{$classdef->[0]};
+    next if defined $entry and $entry->{CODE};
+
     $script .= qq{sub $classdef->[0] () {'$classdef->[1]'}\n};
   }
 
@@ -174,7 +179,7 @@ END
 
 sub make_class {
   my ($self, $class, $super, $slots) = @_;
-  YATT::Inc->add_inc($super);
+  YATT::Inc->add_inc($class);
   <<END . ($super ? <<END : "") . ($slots ? <<END : "") . "\n";
 package $class;
 END

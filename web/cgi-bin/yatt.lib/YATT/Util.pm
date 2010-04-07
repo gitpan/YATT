@@ -147,6 +147,9 @@ sub escape {
       } elsif (ref $str eq 'SCALAR') {
 	# PASS Thru. (Already escaped)
 	$$str;
+      } elsif (ref($str) =~ /^YATT::Util::/) {
+	# Yet another PASS Thru. (Already escaped)
+	$$str;
       } else {
 	my $copy = $str;
 	$copy =~ s{([<>&\"\'])}{$escape{$1}}g;
@@ -212,7 +215,8 @@ sub attr {
   my ($attname) = shift;
   my @result = grep {defined $_ && $_ ne ''} @_;
   return '' unless @result;
-  sprintf q{ %s="%s"}, $attname, join ' ', @result;
+  bless \(sprintf q{ %s="%s"}, $attname, join ' ', @result)
+   , __PACKAGE__ . '::attr';
 }
 
 sub named_attr {
@@ -220,6 +224,14 @@ sub named_attr {
   return '' unless defined $value && $value ne '';
   sprintf('%s%s="%s"', defined $spc ? $spc : ' '
 	  , $attname, YATT::escape($value));
+}
+
+{
+  package YATT::Util::attr;
+  use overload qw("" stringify);
+  sub stringify {
+   ${$_[0]}
+  }
 }
 
 sub resume {
@@ -299,11 +311,18 @@ sub add_arg_order_in {
   $arg;
 }
 
-BEGIN {
+sub is_debug {
   my $db = $main::{"DB::"};
+  defined $db and defined ${*{$db}{HASH}}{sub};
+}
+
+sub no_lineinfo {
+  is_debug() and not $ENV{DEBUG_DETAIL};
+}
+
+BEGIN {
   # check if DB::sub exists.
-  if (defined $db and defined ${*{$db}{HASH}}{sub}
-      and not $ENV{DEBUG_DETAIL}) {
+  if (no_lineinfo()) {
     *needs_line_info = sub () { 0 };
     *line_info = sub {""};
     require Scalar::Util;

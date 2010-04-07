@@ -12,13 +12,15 @@ use YATT::Exception;
 
 {
   package YATT::Registry::NS; use YATT::Inc;
-  use Exporter qw(import);
+  BEGIN {require Exporter; *import = \&Exporter::import}
   use base qw(YATT::Class::Configurable);
   use YATT::Fields qw(Widget
 		      cf_nsid cf_parent_nsid cf_base_nsid
 		      cf_pkg cf_special_entities
 		      cf_name cf_vpath cf_loadkey
-		      cf_mtime cf_age);
+		      cf_mtime cf_age
+		      ^is_loaded
+		    );
   # When fields is empty, %FIELDS doesn't blessed.
   # This causes "Pseudo-hashes are deprecated"
 
@@ -43,7 +45,7 @@ use YATT::Registry::NS;
 use YATT::Util::Symbol;
 
 use base Dir;
-use YATT::Fields qw(^Loader NS last_nsid ^root_is_loaded
+use YATT::Fields qw(^Loader NS last_nsid
 		    cf_auto_reload
 		    cf_type_map
 		    cf_debug_registry
@@ -52,6 +54,8 @@ use YATT::Fields qw(^Loader NS last_nsid ^root_is_loaded
 		    cf_no_lineinfo
 		    current_parser
 		    cf_default_base_class
+		    cf_use
+		    loading
 		    nspattern
 		  )
   , ['^cf_namespace' => qw(yatt perl)]
@@ -75,7 +79,7 @@ sub new {
   $root->refresh($root);
 
   # Now safe to lift @ISA.
-  $root->{root_is_loaded} = 1;
+  $root->{is_loaded} = 1;
 
   $root;
 }
@@ -188,10 +192,27 @@ sub configure_base {
 
 #----------------------------------------
 
+{
+  our $IS_RELOADING;
+  sub is_reloading { $IS_RELOADING }
+  sub with_reloading_flag {
+    (my Root $root, my ($flag, $sub)) = @_;
+    local $IS_RELOADING = $flag;
+    $sub->();
+  }
+}
+
+#----------------------------------------
+
 sub Entity (*$) {
   my ($name, $sub) = @_;
   my ($instClass) = caller;
-  *{globref($instClass, "entity_$name")} = $sub;
+  my $glob = globref($instClass, "entity_$name");
+  if (MY->is_reloading and defined *{$glob}{CODE}) {
+    # To avoid 'Subroutine MyApp5::entity_bar redefined'.
+    undef *$glob;
+  }
+  *$glob = $sub;
 }
 
 sub ElementMacro (*$) {
@@ -267,10 +288,26 @@ sub refresh {
   return if $node->{cf_age} and not $root->{cf_auto_reload};
   return unless $root->{Loader};
 
+  # age があるのに、 is_loaded に達してない == まだ構築の途中。
+  return if $node->{cf_age} and not $node->{is_loaded};
+  $root->{loading}{$node->{cf_nsid}} = 1;
+
   print STDERR "Referesh: $node->{cf_loadkey}\n"
     if $root->{cf_debug_registry};
 
   $root->{Loader}->handle_refresh($root, $node);
+  $node->{is_loaded} = 1;
+  delete $root->{loading}{$node->{cf_nsid}};
+}
+
+sub mark_load_failure {
+  my Root $root = shift;
+  while ((my $nsid, undef) = each %{$root->{loading}}) {
+    my NS $ns = $root->nsobj($nsid);
+    # 仮に、一度は load 済みだとする。
+    $ns->{is_loaded} = 1;
+    delete $root->{loading}{$nsid};
+  }
 }
 
 sub get_ns {
@@ -305,7 +342,7 @@ sub get_widget_from_template {
   my $widget;
 
   # Relative lookup.
-  $widget = $tmpl->lookup_widget($root, @_)
+  $widget = $tmpl->lookup_widget($root, @_ ? @_ : $nsname)
     and return $widget;
 
   # Absolute, ns-specific lookup.
@@ -335,6 +372,17 @@ sub get_widget_from_dir {
 }
 
 {
+  sub YATT::Registry::NS::list_declared_widget_names {
+    (my NS $tmpl) = @_;
+    my @result;
+    foreach my $name (keys %{$tmpl->{Widget}}) {
+      my $w = $tmpl->{Widget}{$name};
+      next unless $w->declared;
+      push @result, $name;
+    }
+    @result;
+  }
+
   # For relative lookup.
   sub YATT::Registry::NS::Template::lookup_widget {
     (my Template $tmpl, my Root $root) = splice @_, 0, 2;
@@ -597,7 +645,7 @@ use YATT::Widget;
 
 use YATT::LRXML; # for Builder.
 use YATT::Types
-  ([WidgetBuilder => [qw(cf_widget cf_template)]]
+  ([WidgetBuilder => [qw(cf_widget ^cf_template cf_root_builder)]]
    , -base => qw(YATT::LRXML::Builder)
    , -alias => [Builder => __PACKAGE__ . '::WidgetBuilder'
 		, Scanner => 'YATT::LRXML::Scanner']
@@ -682,24 +730,43 @@ sub declare_base {
   my Template $this = $builder->{cf_template};
   my Template $base = $this->lookup_template($root, $path)
     or die $scan->token_error("Can't find template $path");
+
+  # XXX: refresh は lookup_template の中ですべきか？
+  $root->refresh($base);
+
   # 名前は保存しなくていいの?
   $this->{cf_base_template} = $base->{cf_nsid};
+
+  $root->add_isa($root->get_package($this)
+		 , $root->get_package($base));
 
   # builder を返すことを忘れずに。
   $builder;
 }
 
 sub declare_args {
-  (my Root $root, my Builder $builder, my ($scan, $nc, $parser)) = @_;
+  (my Root $root, my Builder $builder
+   , my ($scan, $nc, $parser, @configs)) = @_;
   if ($builder->{parent}) {
     die $scan->token_error("Misplaced yatt:args");
   }
+  # widget -> args の順番で出現する場合もある。
+  # root 用の builder を取り出し直す
+  if ($builder->{cf_root_builder}) {
+    $builder = $builder->{cf_root_builder};
+  }
   my Widget $widget = $builder->{cf_widget};
+  $widget->{cf_declared} = 1;
   $widget->{cf_decl_start} = $scan->{cf_last_linenum};
   $widget->{cf_body_start} = $scan->{cf_last_linenum} + $scan->{cf_last_nol};
+  $widget->configure(@configs) if @configs;
   $root->define_args($widget, $nc);
   $root->after_define_args($widget);
   $builder;
+}
+
+sub declare_params {
+  shift->declare_args(@_, public => 1);
 }
 
 sub declare_widget {
@@ -718,6 +785,7 @@ sub declare_widget {
   # XXX: filename, lineno
   my Widget $widget = $root->create_widget_in
     ($builder->{cf_template}, $name
+     , declared => 1
      , filename  => $builder->{cf_template}->metainfo->cget('filename')
      , decl_start => $scan->{cf_last_linenum}
      , body_start => $scan->{cf_last_linenum} + $scan->{cf_last_nol});
@@ -730,7 +798,12 @@ sub declare_widget {
 		      , template => $builder->{cf_template}
 		      , startpos => $scan->{cf_index}
 		      , startline => $scan->{cf_linenum}
-		      , linenum   => $scan->{cf_linenum});
+		      , linenum   => $scan->{cf_linenum}
+		      # widget -> args に戻るためには root_builder を
+		      # 渡さねばならぬ
+		      , root_builder =>
+		      $builder->{cf_root_builder} || $builder
+		     );
 }
 
 sub create_widget_in {
@@ -783,18 +856,32 @@ sub add_decl_attribute {
   }
 
   my ($type, @param) = $args->parse_typespec;
-  $target->add_arg($argname, $root->create_var($type, $args, @param));
+  my ($typename, $subtype) = do {
+    if (ref $type) {
+      ($type->[0], [@{$type}[1 .. $#$type]])
+    } else {
+      ($type, undef);
+    }
+  };
+  if (defined $typename and my $sub = $root->can("attr_declare_$typename")) {
+    $sub->($root, $target, $args, $argname, $subtype, @param);
+  } else {
+    $target->add_arg($argname, $root->create_var($type, $args, @param));
+  }
 }
 
 sub create_var {
-  (my Root $root, my ($type, $args)) = splice @_, 0, 3;
+  (my Root $root, my ($type, $args, @param)) = @_;
   $type = '' unless defined $type;
-  defined (my $class = $root->{cf_type_map}{$type})
-    or croak "No such type: $type";
-  if (my $sub = $root->can("create_var_$type")) {
-    $sub->($root, $args, @_);
+  my ($primary, @subtype) = ref $type ? @$type : $type;
+  defined (my $class = $root->{cf_type_map}{$primary})
+    or croak $root->node_error($args, "No such type: %s", $primary);
+  unshift @param, subtype => @subtype >= 2 ? \@subtype : $subtype[0]
+    if @subtype;
+  if (my $sub = $root->can("create_var_$primary")) {
+    $sub->($root, $args, @param);
   } else {
-    $class->new(@_);
+    $class->new(@param);
   }
 }
 
@@ -813,7 +900,6 @@ sub create_var {
     my $type = $node->type_name;
     if (my $sub = $loader->can("refresh_$type")) {
       $sub->($loader, $root, $node);
-      $node->{cf_age} ||= 1;
     } else {
       confess "Can't refresh type: $type";
     }
@@ -833,6 +919,14 @@ sub create_var {
   use base qw(YATT::Registry::Loader File::Spec);
   use YATT::Fields qw(cf_DIR cf_LIB);
   sub initargs { qw(cf_DIR) }
+  sub init {
+    my ($self, $dir) = splice @_, 0, 2;
+    $self->SUPER::init($dir, @_);
+    if (-d (my $libdir = "$dir/lib")) {
+      require lib; import lib $libdir
+    }
+    $self;
+  }
 
   use YATT::Registry::NS;
   use YATT::Util;
@@ -860,6 +954,9 @@ sub create_var {
     # ファイルリストの処理.
     return unless $loader->is_modified($dirname, $dir->{cf_mtime}{$dirname});
 
+    my $is_reload = $dir->{cf_age}++;
+    undef $dir->{is_loaded};
+
     if (is_tainted($dirname)) {
       croak "Directory $dirname is tainted"
     }
@@ -873,13 +970,13 @@ sub create_var {
       $loader->load_dir($root, $dir, $dirname);
     }
 
-    ++$dir->{cf_age};
-
     # RC 読み込みの前に、 default_base_class を設定。
     if ($root->{cf_default_base_class}
 	and ($root->{cf_default_base_class} ne $root->{cf_pkg}
-	     or $root->root_is_loaded)) {
+	     or $root->{is_loaded})) {
       # XXX: add_isa じゃなくて ensure_isa だね。
+      #print STDERR "loading default_base_class $root->{cf_default_base_class}"
+      # . " for dir $dirname\n";
       $root->checked_eval(qq{require $root->{cf_default_base_class}});
       $root->add_isa(my $pkg = $root->get_package($dir)
 		     , $root->{cf_default_base_class});
@@ -888,11 +985,16 @@ sub create_var {
     # RC 読み込みは、最後に
     my $rcfile = $loader->catfile($dirname, $loader->RCFILE);
     if (-r $rcfile) {
-      my $lineinfo = $root->{cf_no_lineinfo} ? ""
-	: sprintf(qq{\n#line 1 "%s"\n}, $rcfile);
-      my $script = untaint_any($loader->checked_read_file($rcfile));
+      my $script = "";
+      $script .= ";no warnings 'redefine';" if $is_reload;
+      $script .= sprintf(qq{\n#line 1 "%s"\n}, $rcfile)
+	unless $root->{cf_no_lineinfo};
+      $script .= untaint_any($loader->checked_read_file($rcfile));
       &YATT::break_rc;
-      $root->eval_in_dir($dir, $lineinfo . $script);
+      $root->with_reloading_flag
+	($is_reload, sub {
+	   $root->eval_in_dir($dir, $script);
+	 });
       &YATT::break_after_rc;
 
       $dir->after_rc_loaded($root);
@@ -910,13 +1012,14 @@ sub create_var {
       my $path = $loader->catfile($dirname, $name);
       # entry を作るだけ。load はしない。→ mtime も、子供側で。
       if (-d $path) {
+	next unless $name =~ /^(?:\w|-)+$/; # Not CC for future widechar.
 	$dir->{Dir}{$name} ||= $loader->{Cache}{$path}
 	  ||= $root->createNS(Dir => name => $name
 			      , loadkey => untaint_any($path)
 			      , parent_nsid => $dir->{cf_nsid}
 			      , base_nsid   => $dir->{cf_base_nsid}
 			     );
-      } elsif ($name =~ /^(\w+)\.html?$/) {
+      } elsif ($name =~ /^(\w+)\.html?$/) { # XXX: Should allow '-'.
 	$dir->{Template}{$1} ||= $loader->{Cache}{$path}
 	  ||= $root->createNS(Template => name => $1
 			      , loadkey => untaint_any($path)
@@ -945,6 +1048,9 @@ sub create_var {
     if (my $cleaner = $root->can("forget_template")) {
       $cleaner->($root, $tmpl);
     }
+
+    my $is_reload = $tmpl->{cf_age}++;
+    undef $tmpl->{is_loaded};
 
     $root->add_isa(my $pkg = $root->get_package($tmpl)
 		   , $root->get_package($tmpl->{cf_parent_nsid}));

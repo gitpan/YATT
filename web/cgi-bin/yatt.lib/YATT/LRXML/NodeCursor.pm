@@ -37,6 +37,13 @@ BEGIN {
       ->after_next;
   }
 
+  sub clone {
+    my MY $orig = shift;
+    ref($orig)->new($orig->{cf_array}, $orig->{cf_path}
+		    # XXX: To compensate init()
+		    , $orig->{cf_index} - YATT::LRXML::Node::_BODY);
+  }
+
   sub parent {
     my MY $path = shift; $path->{cf_path}
   }
@@ -75,12 +82,19 @@ sub new_path {
   $self->Path->new($self->{tree}, shift); # XXX: tree でいいの?
 }
 
+sub clone_path {
+  my MY $self = shift;
+  my Path $path = shift || $self->{cf_path};
+  $self->Path->new($path->{cf_array}, $path ? $path->{cf_path} : undef);
+}
+
 sub clone {
   (my MY $self, my ($path)) = @_;
   # XXX: 他のパラメータは? 特に、継承先で足したパラメータ。
   ref($self)->new($self->{tree}
 		  , metainfo => $self->{cf_metainfo}
-		  , path => ($path || $self->{cf_path}));
+		  , path => ($path || ($self->{cf_path} ? $self->{cf_path}->clone
+				       : undef)));
 }
 
 sub variant_builder {
@@ -151,9 +165,10 @@ sub clone_filtered_by {
   my ($hash, $all) = @_;
   my $boundary = $all ? 'readable' : 'is_primary_attribute';
   for (; $orig->$boundary(); $orig->next) {
-    my $name;
-    if ($orig->is_attribute and $name = $orig->node_name and $hash->{$name}) {
-      ${$hash->{$name}} = $orig->current;
+    my @name;
+    if ($orig->is_attribute and @name = $orig->node_path
+	and $hash->{$name[0]}) {
+      ${$hash->{$name[0]}} = $orig->current;
       next;
     }
     $clone->add_node(copy_array($orig->current));
@@ -366,6 +381,21 @@ sub size {
   }
 }
 
+sub has_parent {
+  my MY $self = shift;
+  defined (my Path $path = $self->{cf_path}) or return 0;
+  $path->{cf_path}
+}
+
+sub depth {
+  my MY $self = shift;
+  my $depth = 0;
+  while (defined (my Path $path = $self->{cf_path})) {
+    $depth++;
+  }
+  $depth;
+}
+
 sub startline {
   my MY $self = shift;
   $self->metainfo->cget('startline');
@@ -458,10 +488,11 @@ sub parse_typespec {
   my ($head, @rest) = $self->node_children;
   unless (defined $head) {
     ()
-  } elsif ($head =~ s{^(\w+)?(?:([|/?!])(.*))?}{}s) {
+  } elsif ($head =~ s{^(\w+((?:\:\w+)*))?(?:([|/?!])(.*))?}{}s) {
     # $1 can undef.
-    ($1, default => @rest ? [defined $3 ? ($3) : (), @rest] : $3
-     , default_mode => $2)
+    ($1 && $2 ? [split /:/, $1] : $1
+     , default => @rest ? [defined $4 ? ($4) : (), @rest] : $4
+     , default_mode => $3)
   } else {
     (undef);
   }
@@ -479,12 +510,14 @@ sub next_is_body {
 }
 
 sub text_is_attribute { 0 }
+sub text_is_bare_attribute { 0 }
 sub text_is_primary_attribute { 0 }
 sub text_is_quoted_by_element { 0 }
 sub text_node_size { 1 }
 sub text_node_type { YATT::LRXML::Node::TEXT_TYPE }
 sub text_node_body { shift }
 sub text_node_type_name { 'text' }
+sub text_node_flag { 0 }
 sub text_node_name { undef }
 sub text_node_children {
   if (ref $_[0]) {

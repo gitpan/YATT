@@ -57,6 +57,7 @@ sub clone {
 
 sub cget {
   (my MY $self, my ($cf)) = @_;
+  $cf =~ s/^-//; # For Tcl/Tk co-operatability.
   my $fields = fields_hash($self);
   croak "Can't cget $cf" unless exists $fields->{"cf_$cf"};
   $self->{"cf_$cf"};
@@ -136,6 +137,9 @@ sub after_configure {
   # $self->SUPER::after_configure;
   foreach my $cf (grep {/^cf_/} keys %{fields_hash($self)}) {
     next if defined $self->{$cf};
+# XXX: should be:
+#    (my $name = $cf) =~ s/^cf_//;
+#    my $sub = $self->can("default_$name") or next;
     my $sub = $self->can("default_$cf") or next;
     $self->{$cf} = $sub->();
   }

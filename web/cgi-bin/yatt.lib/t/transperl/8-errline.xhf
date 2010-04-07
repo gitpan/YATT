@@ -1,5 +1,24 @@
 # -*- coding: utf-8 -*-
 
+FILE: doc/.htyattroot
+IN:
+ no_lineinfo: 0
+
+TITLE: (static) missing close tag
+IN:
+ foo
+ <yatt:my bar>
+ERROR: Missing close tag 'my' at line 2
+
+
+TITLE: (static) tag open/close mismatch
+IN:
+ foo
+ <yatt:my bar>
+ </yatt:foreach>
+ERROR: TAG 'my' line 2 closed by /foreach at file \S+ line 3
+
+
 TITLE: (static) var in toplevel
 IN:
  &yatt:x;
@@ -233,3 +252,9 @@ IN:
  bar
  baz
 ERROR: ^Use of uninitialized value in print at \S+ line 7\.\n$
+
+
+TITLE: entpath
+IN:
+ &yatt:array[func(x,:y)];
+ERROR: ^Can't parse entity_path group .*?, at file \S+ line 1\n$

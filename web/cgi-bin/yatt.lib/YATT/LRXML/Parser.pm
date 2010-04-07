@@ -163,6 +163,12 @@ sub organize {
 			   , $toktype => $ns, $body);
     }
   }
+  if ($builder->{cf_endtag} and $builder->{parent}) {
+    die "Missing close tag '$builder->{cf_endtag}'"
+      ." at line $builder->{cf_startline}"
+      .$scan->{cf_metainfo}->in_file." \n";
+  }
+  
   if (wantarray) {
     ($self->tree, $self->{metainfo});
   } else {
@@ -270,7 +276,7 @@ sub re_arg_decls {
      (?: $SQ             # 5
      | $DQ               # 6
      | $BARE             # 7
-     | (\[)(?:\s* (\w+)) # 8, 9
+     | (\[)(?:\s* (\w+(?:\:\w+)*)) # 8, 9
      )
   }xs;
   # '[ word' を一括で取り出すのは、次に ^\s+ を残しておくため.
@@ -342,6 +348,7 @@ sub parse_entities {
   # XXX: 行番号情報を受け取れた方が、嬉しいのだが…
   return undef unless defined $_[0]; # make sure single scalar is returned.
   return '' if $_[0] eq '';
+  return $_[0] unless defined $$self{re_entity};
   my @tokens = split $$self{re_entity}, $_[0];
   return $tokens[0] if @tokens == 1;
   my @result;
@@ -608,7 +615,7 @@ sub re_subscript {
 sub re_entity_pathexpr {
   my ($self, $capture, $ns) = @_;
   $ns = $self->re_prefix(0, $self->entity_ns($ns), '');
-  my $body = qr{[:\.\w\$\-\+\*/%<>=\[\]\{\}\(,\)]*};
+  my $body = qr{[\@:\.\w\$\-\+\*/%<>=\[\]\{\}\(,\)]*};
   if (defined $capture and $capture > 1) {
     qr{&($ns\b$body);}xs;
   } else {

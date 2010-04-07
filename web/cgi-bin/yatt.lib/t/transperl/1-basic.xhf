@@ -20,6 +20,14 @@ IN:
  <!perl:widget baz>baz
 ERROR: ^Unknown declarator \(<!perl:bar >\), at
 
+
+FILE: doc/nodecl.html
+IN: foo bar baz
+
+TITLE: file widget without decl
+IN: <yatt:nodecl/>
+OUT: foo bar baz
+
 TITLE: one template, bodyless
 IN:
  <!yatt:args x y>
@@ -79,6 +87,23 @@ IN:
  
  <!yatt:widget hello>
 ERROR: Misplaced yatt:widget in: \([^\)]+\), at file \S+ line 4
+
+
+TITLE: widget -> args ordering.
+BREAK: 1
+IN:
+ <!yatt:widget hello x y>
+ &yatt:x; - &yatt:y;
+ <!yatt:args x y z>
+ <yatt:hello x y/> &yatt:z;
+PARAM[
+- a
+- b
+- c
+]
+OUT:
+ a - b
+  c
 
 FILE: doc/envelope.html
 IN: <!yatt:args title=text>

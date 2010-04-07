@@ -70,13 +70,85 @@ sub is_entpath {
     , [[call => foo => [text => 'bar'], [call => 'baz']
        , [text => '']]];
 
+  is_entpath q{:foo(bar,{key:val,k2:v2},,)}
+    , [[call => foo => [text => 'bar']
+	, [hash => [text => 'key'], [text => 'val']
+	   , [text => 'k2'], [text => 'v2']]
+	, [text => '']]];
+
+  is_entpath q{:foo(bar,{key:val,k2,:v2:path},,)}
+    , [[call => foo => [text => 'bar']
+	, [hash => [text => 'key'], [text => 'val']
+	   , [text => 'k2'], [[var => 'v2'],[var => 'path']]]
+	, [text => '']]];
+
   is_entpath q{:yaml(config):title}
     , [[call => yaml => [text => 'config']]
        , [var  => 'title']
       ];
 
+  is_entpath q{:foo(:config,title)}
+    , [[call => foo => [var => 'config'], [text => 'title']]];
+
   is_entpath q{:foo[3][8]}
     , [[var => 'foo'], [aref => [expr => '3']], [aref => [expr => '8']]];
+
+  is_entpath q{:x[0][:y][1]}
+    , [[var => 'x']
+       , [aref => [expr => '0']]
+       , [aref => [var => 'y']]
+       , [aref => [expr => '1']]];
+
+  is_entpath q{:x[:y[0][:z]][1]}
+    , [[var => 'x']
+       , [aref =>
+	  [[var => 'y']
+	   , [aref => [expr => '0']]
+	   , [aref => [var => 'z']]]]
+       , [aref => [expr => '1']]];
+
+  is_entpath q{:foo([3][8])}
+    , [[call => foo =>
+	[[array => [text => '3']]
+	 , [aref => [expr => '8']]]]];
+
+  #----------------------------------------
+
+  is_entpath q{:where({user=hkoba,status=[assigned,:status,pending]})}
+    , [[call => 'where'
+	, [hash => [text => 'user'], [text => 'hkoba']
+	   , [text => 'status'], [array => [text => 'assigned']
+				  , [var  => 'status']
+				  , [text => 'pending']]]]];
+
+  is_entpath q{:where({user=hkoba,status={!=,:status}})}
+    , [[call => 'where'
+	, [hash => [text => 'user'], [text => 'hkoba']
+	   , [text => 'status'], [hash => [text => '!=']
+				  , [var => 'status']]]]];
+
+  is_entpath q{:where({user=hkoba,status={!=,[assigned,in-progress,pending]}})}
+    , [[call => 'where'
+	, [hash => [text => 'user'], [text => 'hkoba']
+	   , [text => 'status'], [hash => [text => '!=']
+				  , [array => [text => 'assigned']
+				     , [text => 'in-progress']
+				     , [text => 'pending']]]]]];
+
+  is_entpath q{:where({user=hkoba,status={!=,completed,-not_like=pending%}})}
+    , [[call => 'where'
+	, [hash => [text => 'user'], [text => 'hkoba']
+	   , [text => 'status']
+	   , [hash => [text => '!='], [text => 'completed']
+	      , [text => -not_like], [text => 'pending%']]]]];
+
+  is_entpath q{:where({priority={<,2},workers={>=,100}})}
+    , [[call => 'where'
+	, ['hash'
+	   , [text => 'priority'], [hash => [text => '<'],  [text => '2']]
+	   , [text => 'workers'],[hash => [text => '>='], [text => '100']]]]];
+
+  #----------------------------------------
 
   is_entpath q{:schema:resultset(Artist):all()}
     , [[var => 'schema']
@@ -116,6 +188,8 @@ sub is_entpath {
        , [call => 'artist']
        , [call => 'name']];
 
+  #----------------------------------------
+
   is_entpath q{:foo(bar):baz():bang}
     , [[call => foo => [text => 'bar']]
        , [call => 'baz']
@@ -141,4 +215,34 @@ sub is_entpath {
 	, [expr => '$x[8]{y}:z']]
       , [var => 'hoe']];
 
+  is_entpath q{:foo(bar${q}baz)}
+    , [[call => 'foo'
+	, [text => 'bar${q}baz']]];
+
+  is_entpath q{:foo(bar,baz,[3])}
+    , [[call => 'foo'
+	, [text => 'bar']
+	, [text => 'baz']
+	, [array => [text => '3']]]];
+
+  is_entpath q{:if(=$$list[0]*$$list[1]==24,yes,no)}
+    , [[call => 'if'
+	, [expr => '$$list[0]*$$list[1]==24']
+	, [text => 'yes']
+	, [text => 'no']]];
+
+  is_entpath q{:if(=($$list[0]+$$list[1])==11,yes,no)}
+    , [[call => 'if'
+	, [expr => '($$list[0]+$$list[1])==11']
+	, [text => 'yes']
+	, [text => 'no']]];
+
+  is_entpath q{:if(=($x+$y)==$z,baz)}
+    , [[call => 'if'
+	, [expr => '($x+$y)==$z']
+	, [text => 'baz']]];
+    
+  is_entpath q{:foo(=@bar)}
+    , [[call => 'foo'
+	, [expr => '@bar']]];
 }

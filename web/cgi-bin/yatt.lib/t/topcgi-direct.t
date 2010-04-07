@@ -20,8 +20,9 @@ my $mech = new WWW::Mechanize(agent => "YATT UnitTest by $ENV{USER}");
 unless (-e "/var/www/cgi-bin/yatt.cgi"
 	and -d "/var/www/cgi-bin/yatt.docs/test") {
   plan skip_all => 'yatt.cgi and testapp is not installed.'; exit;
-} elsif (not $mech->get("http://localhost/")) {
-  plan skip_all => "Can't get http://localhost/"; exit;
+} elsif (not -d "/var/www/manual"
+         or not $mech->get(my $man_url = "http://localhost//manual/")) {
+  plan skip_all => "Can't get $man_url"; exit;
 } else {
   plan qw(no_plan);
 }
@@ -32,10 +33,14 @@ my $check = sub {
   SKIP: {
      skip "Can't fetch.", 1 unless $res;
 
+     my $content = $mech->content;
+     # To hide printenv.
+     $content =~ s{<table[^>]*>.*</table>\s*}{}xs if $content;
+
      unless (ref $is) {
-       is $mech->content, $is, $title;
+       is $content, $is, $title;
      } elsif (ref $is eq 'Regexp') {
-       like $mech->content, $is, $title;
+       like $content, $is, $title;
      } else {
        die "Unknown";
      }

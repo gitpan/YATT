@@ -12,17 +12,23 @@ use base qw(YATT::Registry);
 use YATT::Fields [cf_mode => 'render']
   , [cf_product => sub {[]}]
   , qw(target_cache
+       delayed_target
+       generating_widget
+       cf_pagevars
        cf_debug_translator);
 
-use Exporter qw(import);
+BEGIN {require Exporter; *import = \&Exporter::import}
 our @EXPORT_OK = qw(qqvalue qparen);
 our @EXPORT = @EXPORT_OK;
 
 use YATT::Registry::NS;
 use YATT::Widget;
 use YATT::Util qw(checked_eval add_arg_order_in terse_dump coalesce);
-use YATT::LRXML::Node qw(node_path node_body node_name node_children
+use YATT::LRXML::Node qw(node_path node_body node_name
+			 node_size node_flag
+			 node_children
 			 create_node
+			 stringify_node
 			 TEXT_TYPE ELEMENT_TYPE ENTITY_TYPE);
 
 use YATT::LRXML::EntityPath;
@@ -60,8 +66,8 @@ sub call_handler {
   $handler->($pkg, @_);
 }
 
-sub get_handler_to {
-  (my MY $trans, my ($method, @elpath)) = @_;
+sub parse_elempath {
+  my ($pack, @elpath) = @_;
   if (@elpath == 1) {
     if (ref $elpath[0]) {
       @elpath = @{$elpath[0]};
@@ -72,6 +78,13 @@ sub get_handler_to {
 
   # root dir should be ignored.
   shift @elpath if !defined $elpath[0] || $elpath[0] eq '';
+
+  @elpath;
+}
+
+sub get_handler_to {
+  (my MY $trans, my ($method)) = splice @_, 0, 2;
+  my @elpath = $trans->parse_elempath(@_);
 
   my @result;
   if (wantarray) {
@@ -154,19 +167,43 @@ sub generate {
   $gen->emit;
 }
 
+sub mark_delayed_target {
+  (my MY $gen, my Widget $widget) = @_;
+  $gen->{delayed_target}{$widget->{cf_template_nsid}}++;
+}
+
 sub ensure_widget_is_generated {
   (my MY $gen, my Widget $widget) = @_;
   $gen->ensure_template_is_generated($widget->{cf_template_nsid});
 }
 
 sub ensure_template_is_generated {
-  (my MY $gen, my $tmplid) = @_;
-  $tmplid = $tmplid->cget('nsid') if ref $tmplid;
-  return if $gen->{target_cache}{$tmplid}++;
+  #  (my MY $gen, my $tmplid) = @_;
+  #  $tmplid = $tmplid->cget('nsid') if ref $tmplid;
+  (my MY $gen, my $id_or_obj) = @_;
+  (my $tmplid, my Template $tmpl) = do {
+    if (ref $id_or_obj) {
+      ($id_or_obj->cget('nsid'), $id_or_obj)
+    } else {
+      ($id_or_obj, $gen->nsobj($id_or_obj));
+    }
+  };
+  if (my $baseid = $tmpl->{cf_base_template}) {
+    $gen->ensure_template_is_generated($baseid);
+  }
+  unless ($gen->{target_cache}{$tmplid}++) {
 
-  # eval は？
-  push @{$$gen{cf_product}}
-    , $gen->generate_template($gen->nsobj($tmplid));
+    # eval は？
+    push @{$$gen{cf_product}}
+      , $gen->generate_template($gen->nsobj($tmplid));
+  }
+  if (my @delayed = keys %{$gen->{delayed_target}}) {
+    foreach my $nsid (@delayed) {
+      next if $gen->{target_cache}{$nsid};
+      delete $gen->{delayed_target}{$nsid};
+      $gen->ensure_template_is_generated($nsid);
+    }
+  }
 }
 
 sub forget_template {
@@ -175,16 +212,35 @@ sub forget_template {
   delete $gen->{target_cache}{$tmplid} ? 1 : 0;
 }
 
+my %calling_conv;
+
 sub generate_template {
   (my MY $gen, my Template $tmpl) = @_;
   print STDERR "Generate: $tmpl->{cf_loadkey}\n"
     if $gen->{cf_debug_translator};
   my $metainfo = $tmpl->metainfo;
-  join "", q{package } . $gen->get_package($tmpl) . ';'
-    , map {$gen->generate_widget($_, $metainfo)} @{$tmpl->widget_list};
+  my @use = map {
+    unless (defined $_) {
+      ()
+    } else {
+      map {"use $_;"} ref $_ ? @$_ : $_
+    }
+  } $gen->{cf_use};
+  my @file_scope = do {
+    if ($gen->{cf_pagevars}) {
+      $gen->checked_eval(qq{require $gen->{cf_pagevars}});
+      push @use, "use $gen->{cf_pagevars} (qw($tmpl->{cf_name}), 1);";
+      ($gen->{cf_pagevars}->build_scope_for($gen, $tmpl->{cf_name})
+       , [\%calling_conv]);
+    } else {
+      \%calling_conv;
+    }
+  };
+  join("", q{package } . $gen->get_package($tmpl) . ';'
+       , join("",@use)
+       , map {$gen->generate_widget($_, $metainfo, \@file_scope)}
+       @{$tmpl->widget_list});
 }
-
-my %calling_conv;
 
 sub generate_lineinfo {
   (my MY $gen, my Widget $widget, my ($start, $prefix)) = @_;
@@ -193,12 +249,16 @@ sub generate_lineinfo {
     , $start, $widget->{cf_filename};
 }
 
+sub generating_widget {
+  my MY $gen = shift;
+  $gen->{generating_widget}[0];
+}
+
 sub generate_widget {
-  (my MY $gen, my Widget $widget, my ($metainfo)) = @_;
+  (my MY $gen, my Widget $widget, my ($metainfo, $file_scope)) = @_;
+  local $gen->{generating_widget}[0] = $widget;
   my @body = $gen->generate_body
-    ([{}
-      , [$widget->arg_dict
-	 , [\%calling_conv]]]
+    ([{}, $widget->widget_scope($file_scope)]
      , $widget->cursor(metainfo => $metainfo->clone
 		       (startline => $widget->{cf_body_start}
 			, caller_widget => $widget)));
@@ -381,7 +441,8 @@ sub trans_text {
   if ($node->node_is_beginning) {
     $pre = $1 if $body =~ s/^($CRLF+)//;
   } elsif ($node->node_is_end) {
-    if ($node->metainfo->caller_widget->no_last_newline) {
+    if (not $node->has_parent
+	and $node->metainfo->caller_widget->no_last_newline) {
       $body =~ s/($CRLF+)$//s;
     } else {
       $post = $2 if $body =~ s/($CRLF)($CRLF+)$/$1/s;
@@ -419,7 +480,7 @@ sub trans_pi {
 
 sub genexpr_node {
   (my MY $trans, my ($scope, $early_escaped, $node)) = @_;
-  join("", map { ref $_ ? $$_ : $_ }
+  join("", map { ref $_ ? $$_ : $trans->dots_for_arrows(my $cp = $_) }
        $trans->mark_vars($scope, $early_escaped, $node));
 }
 
@@ -447,6 +508,12 @@ sub trans_html {
   my @script;
   for (; $item->readable; $item->next) {
     last unless $item->is_primary_attribute;
+    my $name = $item->node_name;
+    if (my $var = $trans->has_pass_through_var($scope, $item, $name)) {
+      push @script, qparen($string), $var->as_escaped;
+      $string = '';
+      next;
+    }
     $string .= ' ';
     my ($open, $close) = $item->node_attribute_format;
     $string .= $open;
@@ -534,21 +601,15 @@ sub gencall_always {
   (my MY $trans, my ($scope, $node)) = @_;
 
   my $tmpl = $trans->get_template_from_node($node);
-  my @elempath = $node->node_path
-    or die $trans->node_error($node, "Empty element path");
+  my @elempath = $node->node_path or do {
+    die $trans->node_error($node, "Empty element path");
+  };
 
-  # ■ 局所引数
+  # ■ 局所引数… これも、型の固有処理に任せる. delegate もここで。
   if (my $codevar = $trans->find_codearg($scope, @elempath)) {
     # ← 特に、親の call の body の中で、<yatt:body foo=bar/> で
     # 呼ばれるとき, だよね？
-    unless (ref $codevar and $codevar->can('arg_specs')) {
-      die $trans->node_error($node, "Invalid codevar $codevar for @elempath");
-    }
-
-    my ($post, @args) = $trans->genargs_static
-      ($scope, $node->open, $codevar->arg_specs);
-    return \ sprintf '%1$s && %1$s->(%2$s)%3$s', $codevar->as_lvalue
-      , join(", ", @args), $post;
+    return $codevar->gen_call($trans, $scope, $node);
   }
 
   # ■ さもなければ、通常の Widget の呼び出し
@@ -581,13 +642,13 @@ sub gencall {
   if (my ($dict, $order) = $trans->has_unique_argmacro
       ($widget, $node->metainfo->caller_widget)) {
     $node = YATT::ArgMacro->expand_all_macros
-      ($trans, $scope, $node, $dict, $order);
+      ($trans, $scope, $node, $widget, $dict, $order);
   }
 
   my $func = $trans->get_funcname_to($trans->{cf_mode}, $widget);
   # actual 一覧の作成
   my ($post, @args) = $trans->genargs_static
-    ($scope, $node, @{$widget}{qw(arg_dict arg_order)});
+    ($scope, $node, $widget->arg_specs);
 
   # XXX: calling convention 周り
   return \ sprintf(' %s($this, [%s])%s', $func
@@ -595,10 +656,20 @@ sub gencall {
 		   , $post);
 }
 
+sub has_single_bare_varexpr {
+  (my MY $trans, my ($scope, $node)) = @_;
+  my $clone = $node->clone($node->clone_path);
+  my $parent = $clone->parent;
+  return unless $parent->is_bare_attribute and $parent->node_size == 1;
+  my (@expr) = ($trans->mark_vars($scope, ENT_RAW, $clone));
+  return unless @expr and ref $expr[0] eq 'SCALAR';
+  $expr[0];
+}
+
 sub has_pass_through_var {
   (my MY $trans, my ($scope, $args, $name)) = @_;
   return if $args->node_size >= 2;
-  if ($args->node_size == 1 and $args->node_flag == 0) {
+  if ($args->node_size == 1 and ($args->node_flag || 0) == 0) {
     # bareword 渡し。
     $trans->find_var($scope, $args->node_body);
   } elsif ($args->node_size == 0) {
@@ -608,7 +679,7 @@ sub has_pass_through_var {
 }
 
 sub genargs_static {
-  (my MY $trans, my ($scope, $args, $arg_dict, $arg_order)) = @_;
+  (my MY $trans, my ($scope, $args, $arg_dict, $arg_order, $delegate_vars)) = @_;
   my ($body, @actual) = $args->variant_builder;
   my ($postnl, $startline) = ('', $args->linenum);
   for (my $nth = 0; $args->readable; $args->next) {
@@ -617,14 +688,16 @@ sub genargs_static {
       next;
     }
 
-    my ($typename, $name) = $trans->arg_type_and_name($args);
+    my ($name, $typename) = $trans->arg_name_types($args);
     unless (defined $name) {
       $name = $arg_order->[$nth++]
 	or die $trans->node_error($args, "Too many args");
     }
-    my $argdecl = $arg_dict->{$name}
-      or die $trans->node_error($args, "Unknown arg '%s'", $name);
-    # XXX: $typename (type:attname の type) を活用していない。
+    my $argdecl = $arg_dict->{$name};
+    unless ($argdecl) {
+      die $trans->node_error($args, "Unknown arg '%s'", $name);
+    }
+    # XXX: $typename (attname:type の type) を活用していない。
     # XXX: code 型引数を primary で渡したときにまで、 print が作られてる。
     # $args->is_quoted_by_element で判別せよ。
     $actual[$argdecl->argno] = do {
@@ -646,10 +719,14 @@ sub genargs_static {
       = $bodydecl->gen_assignable_node($trans, $scope, $body, 1);
   }
 
-  for (my $i = 0; $i < @actual; $i++) {
+  for (my $i = 0; $i < @$arg_order; $i++) {
     next if defined $actual[$i];
     my $name = $arg_order->[$i];
-    if ($arg_dict->{$name}->is_required) {
+    if ($delegate_vars->{$name}) {
+      # delegate 宣言では、型は同じになるはず。
+      # XXX: 引数rename
+      $actual[$i] = $arg_dict->{$name}->as_lvalue;
+    } elsif ($arg_dict->{$name}->is_required) {
       die $trans->node_error($args->parent
 			     , "Argument '%s' is missing", $name);
     }
@@ -726,6 +803,37 @@ sub has_element_macro {
 
 # XXX: use は perl 固有だから、ここに持たせるのは理にかなう。
 sub declare_use {
+}
+
+sub attr_declare_delegate {
+  (my MY $trans, my ($widget, $args, $argname, $subtype, @param)) = @_;
+  my @elempath = $subtype ? @$subtype : $argname;
+  my Template $tmpl = $trans->get_template_from_node($args);
+  my Widget $base = $trans->get_widget_from_template($tmpl, @elempath);
+  unless ($base) {
+    die $trans->node_error($args, "No such widget %s"
+			   , join(":", @elempath));
+  }
+  if ($tmpl->{cf_nsid} != $base->template_nsid) {
+    $trans->mark_delayed_target($base);
+  }
+
+  # pass thru する変数名の一覧。
+  # でも、未指定なものだけね。
+  # XXX: 引数rename
+  my %vars; $vars{$_} = 1 for $widget->copy_specs_from($base);
+
+  #
+  # arg とは別の、コンパイル時のみの仮想的な変数として登録。
+  #
+  if ($widget->has_virtual_var($argname)) {
+    die $trans->node_error($args, "Duplicate delegate? %s", $argname);
+  }
+  $widget->add_virtual_var
+    ($argname, $trans->create_var(delegate => $args
+				  , base_path => \@elempath
+				  , base_widget => $base
+				  , delegate_vars => \%vars, @param));
 }
 
 sub after_define_args {
@@ -816,7 +924,8 @@ sub add_decl_entity {
 # 変数関連
 
 use YATT::Types [VarType =>
-		 [qw(cf_varname ^cf_argno cf_default cf_default_mode
+		 [qw(cf_varname ^cf_argno ^cf_subtype
+		     cf_default cf_default_mode
 		     cf_filename cf_linenum
 		   )]]
   , qw(:export_alias);
@@ -861,6 +970,47 @@ sub gen_getargs_dynamic {
   '';
 }
 
+sub gen_pass_through_arg_typed {
+  (my MY $gen, my ($type, $scope, $baseNC, $targetNode)) = @_;
+  my $node = $targetNode
+    ? $gen->fake_cursor_from($baseNC, $targetNode)
+      : $baseNC;
+  my $name = $node->node_name;
+  if (my $var = $gen->has_pass_through_var($scope, $node, $name)) {
+    $var->as_lvalue;
+  } else {
+    $gen->faked_gentype($type => $scope, $node)
+  }
+}
+
+sub try_pass_through {
+  (my MY $trans, my ($scope, $cursor, $rawNode, $defaultFlag)) = @_;
+  if (node_size($rawNode) == 1 and node_flag($rawNode) == 0
+     and (my $nm = node_body($rawNode)) =~ /^\w+$/) {
+
+    # [name=bareword_ident]
+    # Must be an existing variable.
+    if (my $var = $trans->find_var($scope, $nm)) {
+      $var->as_lvalue;
+    } else {
+      die $trans->node_error($cursor, "No such variable '%s'", $nm);
+    }
+  } elsif (node_size($rawNode) == 0) {
+
+    # [name]
+    # variable or flag.
+    if (my $var = $trans->find_var($scope, my $nm = node_name($rawNode))) {
+      $var->as_lvalue;
+    } elsif (defined $defaultFlag) {
+      $defaultFlag
+    } else {
+      die $trans->node_error($cursor, "No such variable '%s'", $nm);
+    }
+  } else {
+    undef;
+  }
+}
+
 sub mark_vars {
   (my MY $trans, my ($scope, $early_escaped, $node)) = @_;
   my @result;
@@ -885,6 +1035,7 @@ sub feed_array_if {
   wantarray ? @{$desc}[1..$#$desc] : $desc;
 }
 
+# $node の情報を借りながら、@_ を generate.
 sub gen_entref_list {
   (my MY $trans, my ($scope, $node)) = splice @_, 0, 3;
   my @result;
@@ -902,6 +1053,7 @@ sub gen_entref_path {
   my @expr = do {
     if (my ($name, @args) = $trans->feed_array_if(call => \@_)) {
       my $pkg = $trans->get_package_from_node($node);
+      my $dont_call;
       my $call = do {
 	# XXX: codevar は、path の先頭だけ。
 	# 引数にも現れるから、
@@ -909,10 +1061,19 @@ sub gen_entref_path {
 	  if (ref $var and $var->can('arg_specs')) {
 	    sprintf('%1$s && %1$s->', $var->as_lvalue);
 	  } elsif (my $handler = $var->can("entmacro_")) {
+            $dont_call++;
 	    $handler->($var, $trans, $scope, $node, \@_, [], @args);
 	  } else {
-	    $var->as_lvalue;
+	    # XXX: 本当は $pkg よりもファイル名を出すべき。
+	    die $trans->node_error
+	      ($node, "not implemented call '%s' for %s in %s"
+	       , $name, $pkg, $node->node_body);
 	  }
+	} elsif (my $handler = $trans->can("entmacro_$name")) {
+	  # XXX: $pkg->can の方が、拡張向きで良いのだが…
+	  # 予約語も持ちたい。
+          $dont_call++;
+	  $handler->($pkg, $trans, $scope, $node, \@_, [], @args);
 	} elsif ($pkg->can(my $en = "entity_$name")) {
 	  sprintf('%s->%s', $pkg, $en);
 	} else {
@@ -921,7 +1082,7 @@ sub gen_entref_path {
 	}
       };
 
-      ref $call ? $call : sprintf q{%s(%s)}, $call, join ", "
+      ($dont_call || ref $call) ? $call : sprintf q{%s(%s)}, $call, join ", "
 	, $trans->gen_entref_list($scope, $node, @args);
     } elsif (($name) = $trans->feed_array_if(var => \@_)) {
       unless ($var = $trans->find_var($scope, $name)) {
@@ -931,6 +1092,11 @@ sub gen_entref_path {
       }
     } elsif (($name) = $trans->feed_array_if(expr => \@_)) {
       $name;
+    } elsif (my @items = $trans->feed_array_if(array => \@_)) {
+      '['.join(", ", $trans->gen_entref_list($scope, $node, @items)).']';
+    } elsif (my @pairs = $trans->feed_array_if(hash => \@_)) {
+      # XXX: '=>' is better.
+      '{'.join(", ", $trans->gen_entref_list($scope, $node, @pairs)).'}';
     } elsif (($name) = $trans->feed_array_if(text => \@_)) {
       qqvalue($name);
     } else {
@@ -993,7 +1159,8 @@ sub decode_entpath {
   my $body = $node->node_body;
   substr($body, 0, 0) = ':' if defined $body and not defined $node->node_name;
   my @entpath = $trans->parse_entpath(join('', map {':'.$_} @$entns)
-				      . coalesce($body, ''));
+				      . coalesce($body, '')
+				      , $trans, $node);
 
   my $has_body = $body ? 1 : 0;
 
@@ -1030,6 +1197,49 @@ sub generate_entref {
   } else {
     $escaped ? $vardecl->as_escaped : $vardecl->as_lvalue;
   }
+}
+
+#========================================
+# マクロなどで、cursor になっていない targetNode を入手した後で、
+# それを再び cursor にして、指定の型のソースを生成する仕組み。
+
+# デフォルト値を最初に指定。
+sub default_gentype {
+  (my MY $trans, my ($default, $type, $scope, $baseNC, $targetNode)) = @_;
+  if (ref $type) {
+    croak "Type mismatch: \$type should be string for default_gentype: $type";
+  }
+  unless (defined $targetNode and node_body($targetNode)) {
+    return $default;
+  }
+#  my $name = node_name($targetNode);
+#  if (my $var
+#      = $trans->has_pass_through_var($scope, $targetNode, $name)) {
+#    $var->as_lvalue;
+#  } else {
+    $trans->faked_gentype($type, $scope, $baseNC, $targetNode);
+#  }
+}
+
+sub faked_gentype {
+  (my MY $trans, my ($type, $scope, $baseNC, $targetNode)) = @_;
+  my $node = $targetNode ? $trans->fake_cursor_from($baseNC, $targetNode)
+    : $baseNC;
+  my $sub = $trans->can("t_$type")
+    or die $trans->node_error($node, "No such argtype: %s", $type);
+  $sub->()->gen_assignable_node($trans, $scope, $node);
+}
+
+# expr 専用。デフォルト値も渡せる。
+sub faked_genexpr {
+  (my MY $trans, my ($scope, $baseNC, $targetNode, $default, $ent_flag)) = @_;
+  unless (defined $targetNode and node_body($targetNode)) {
+    return $default;
+  }
+  # open するのが、faked_gentype(scalar) とも違う所、のはず。
+  my $nc = $trans->fake_cursor_from($baseNC, $targetNode)->open;
+  $trans->genexpr_node($scope, defined $ent_flag ? $ent_flag : ENT_RAW
+		       , $nc);
 }
 
 #========================================
@@ -1094,6 +1304,24 @@ sub YATT::Translator::Perl::VarType::as_escaped {
   sprintf $var->escaped_format, $var->{cf_varname};
 }
 
+sub YATT::Translator::Perl::VarType::as_typespec {
+  shift->type_name;
+}
+
+sub YATT::Translator::Perl::VarType::as_argspec {
+  (my VarType $var) = @_;
+  my $spec = $var->as_typespec;
+  if (my $mode = $var->{cf_default_mode}) {
+    $spec .= $mode;
+    if (defined (my $default = $var->{cf_default})) {
+      $spec .= join "", map {
+	ref $_ ? map(ref $_ ? stringify_node($_) : $_, @$_) : $_
+      } $default;
+    }
+  }
+  $spec;
+}
+
 use YATT::ArgTypes
   (-type_map => \%TYPE_MAP
    , -base => VarType
@@ -1106,15 +1334,33 @@ use YATT::ArgTypes
    , [code   => -alias => 'expr', \ can_call => 1
       # 引数の型情報
       , -fields => [qw(arg_dict arg_order)]]
+   , [delegate => -fields => [qw(cf_base_path
+				 cf_base_widget
+				 cf_delegate_vars)]]
    , qw(:type_name)
   );
 
 $calling_conv{this} = t_scalar->new(varname => 'this');
 $calling_conv{args} = t_scalar->new(varname => 'args');
+$calling_conv{_} = t_scalar->new(varname => '_');
 
 sub YATT::Translator::Perl::t_text::quote_assignable {
   shift;
-  'qq('.join("", map { ref $_ ? '@{['.$$_.']}' : paren_escape($_) } @_).')';
+  my ($nvars);
+  my @items = map {
+    if (ref $_) {
+      $nvars++;
+      $$_
+    } else {
+      # $var is prohibited.
+      qparen($_);
+    }
+  } @_;
+  if (@items == 1 && !$nvars) {
+    $items[0];
+  } else {
+    MY->as_join(@items);
+  }
 }
 
 # XXX: 本当に良いのか?
@@ -1128,9 +1374,19 @@ sub YATT::Translator::Perl::t_html::escaped_format {shift->lvalue_format}
 sub YATT::Translator::Perl::t_html::gen_assignable_node {
   (my VarType $var, my MY $trans, my ($scope, $node, $is_opened)) = @_;
   # XXX: フラグがダサい。
-  $trans->as_join
-    ($trans->generate_body($scope, $is_opened ? $node : $node->open));
+  my $n = $is_opened ? $node : $node->open;
+  if (my $expr = $trans->has_single_bare_varexpr($scope, $n)) {
+    t_scalar->quote_assignable($expr);
+  } else {
+    $trans->as_join($trans->generate_body($scope, $n));
+  }
 }
+
+sub YATT::Translator::Perl::t_attr::as_typespec {
+  my t_attr $var = shift;
+  join(":", $var->type_name, $var->{cf_subtype} || $var->{cf_varname});
+}
+
 
 sub YATT::Translator::Perl::t_attr::entmacro_ {
   (my t_attr $var, my MY $trans
@@ -1138,23 +1394,23 @@ sub YATT::Translator::Perl::t_attr::entmacro_ {
   if (@$restExpr) {
     die $trans->node_error($node, "attr() should be last call.");
   }
+  if (ref $var->{cf_subtype}) {
+    die $trans->node_error($node, "nested subtype for attr");
+  }
   my @expr = $trans->gen_entref_list($scope, $node, @args);
-  \ sprintf(q{print YATT::attr('%s', %s)}
-	    , $var->{cf_default} || $var->{cf_varname}
+  sprintf(q{YATT::attr('%s', %s)}
+	    , $var->{cf_subtype} || $var->{cf_varname}
 	    , join(", ", $var->as_lvalue, @expr));
-}
-
-sub YATT::Translator::Perl::t_attr::gen_getarg {
-  (my t_attr $var, my MY $gen
-   , my ($scope, $widget, $metainfo, $actual)) = @_;
-  $actual;
 }
 
 sub YATT::Translator::Perl::t_attr::as_escaped {
   my t_attr $var = shift;
+  if (ref $var->{cf_subtype}) {
+    die "nested subtype for attr: $var->{cf_varname}";
+  }
   my $realvar = sprintf $var->lvalue_format, $var->{cf_varname};
   sprintf(q{YATT::named_attr('%s', %s)}
-	  , $var->{cf_default} || $var->{cf_varname}
+	  , $var->{cf_subtype} || $var->{cf_varname}
 	  , $realvar);
 }
 
@@ -1173,6 +1429,37 @@ sub YATT::Translator::Perl::t_list::entmacro_expand {
    , my ($scope, $node, $restExpr, $queue, @args)) = @_;
   my $was = join "->", splice @$queue, 0;
   sprintf q{map($_ ? @$_ : (), %s)}, $was;
+}
+
+sub YATT::Translator::Perl::t_list::entmacro_size {
+  (my t_list $var, my MY $trans
+   , my ($scope, $node, $restExpr, $queue, @args)) = @_;
+  my $was = join "->", splice @$queue, 0;
+  sprintf q{scalar(map(defined $_ ? @$_ : (), %s))}, $was;
+}
+
+# XXX: head($n), tail($n)
+
+sub YATT::Translator::Perl::t_list::entmacro_head {
+  (my t_list $var, my MY $trans
+   , my ($scope, $node, $restExpr, $queue, @args)) = @_;
+  my $was = join "->", splice @$queue, 0;
+  sprintf q{map($_ ? $$_[0] : (), %s)}, $was;
+}
+
+sub YATT::Translator::Perl::t_list::entmacro_tail {
+  (my t_list $var, my MY $trans
+   , my ($scope, $node, $restExpr, $queue, @args)) = @_;
+  my $was = join "->", splice @$queue, 0;
+  sprintf q{map($_ ? @{$_}[1..$#$_] : (), %s)}, $was;
+}
+
+sub YATT::Translator::Perl::t_code::gen_call {
+  (my t_code $argdecl, my MY $trans, my ($scope, $node)) = @_;
+  my ($post, @args) = $trans->genargs_static
+    ($scope, $node->open, $argdecl->arg_specs);
+  return \ sprintf '%1$s && %1$s->(%2$s)%3$s', $argdecl->as_lvalue
+    , join(", ", @args), $post;
 }
 
 sub YATT::Translator::Perl::t_code::arg_specs {
@@ -1219,12 +1506,50 @@ sub YATT::Translator::Perl::t_code::add_arg {
   $codevar;
 }
 
+sub YATT::Translator::Perl::t_code::clone {
+  (my t_code $orig) = @_;
+  my t_code $new = $orig->SUPER::clone;
+  my ($dict, $order) = $orig->arg_specs;
+  foreach my $name (@$order) {
+    $new->add_arg($name, $dict->{$name}->clone);
+  }
+  $new
+}
+
 # code 型の変数宣言の生成
 sub create_var_code {
   (my MY $trans, my ($node, @param)) = @_;
   my t_code $codevar = $trans->t_code->new(@param);
   $trans->define_args($codevar, $node->open) if $node;
   $codevar;
+}
+
+sub YATT::Translator::Perl::t_delegate::gen_call {
+  (my t_delegate $argdecl, my MY $trans, my ($scope, $node)) = @_;
+  my $func = $trans->get_funcname_to($trans->{cf_mode}
+				     , $argdecl->{cf_base_widget});
+  # XXX: テストを書け。body が code か html か、だ。
+  # my $body_dict = $argdecl->{cf_base_widget}->get_arg_spec(body => undef);
+  my $body_spec = $argdecl->{cf_base_widget}->{arg_dict}->{body};
+  my $body_scope = do {
+    if ($body_spec->type_name eq 'code') {
+      [$body_spec->{arg_dict}, $scope]
+    } else {
+      $scope
+    }
+  };
+  my ($post, @args) = $trans->genargs_static
+    ([{}, $body_scope]
+     , $node->open, $argdecl->arg_specs);
+  return \ sprintf(' %s($this, [%s])%s', $func
+		   , join(", ", map {defined $_ ? $_ : 'undef'} @args)
+		   , $post);
+}
+
+sub YATT::Translator::Perl::t_delegate::arg_specs {
+  my t_delegate $argdecl = shift;
+  ($argdecl->{cf_base_widget}->arg_specs
+   , $argdecl->{cf_delegate_vars});
 }
 
 #========================================
@@ -1237,22 +1562,23 @@ sub make_arg_spec {
   }
 }
 
-sub arg_type_and_name {
-  (my MY $trans, my ($args, $default)) = @_;
+sub arg_name_types {
+  (my MY $trans, my ($args)) = @_;
   my (@path) = $args->node_path;
-  if (@path > 1) {
-    @path[0, 1]
-  } else {
-    ($default || '', $path[0]);
+  if ($args->is_attribute and $args->is_quoted_by_element) {
+    shift @path;
   }
+  my ($name) = shift @path;
+  @path >= 2 ? ($name, \@path) : ($name, $path[0]);
 }
 
+# macro の、 my:type=var など専用。
 sub feed_arg_spec {
   (my MY $trans, my ($args, $arg_dict, $arg_order)) = splice @_, 0, 4;
   my $found;
   for (my $nth = 0; $args->readable; $args->next) {
     last unless $args->is_primary_attribute;
-    my ($typename, $name) = $trans->arg_type_and_name($args);
+    my ($name, @ext) = $args->node_path;
     unless (defined $name) {
       $name = $arg_order->[$nth++]
 	or die $trans->node_error($args, "Too many args");
@@ -1287,8 +1613,10 @@ sub feed_arg_spec {
     my %local;
     my $loopvar = do {
       if ($my) {
+	my ($x, @type) = node_path($my);
 	my $varname = node_body($my);
-	$local{$varname} = $trans->create_var('', undef, varname => $varname);
+	$local{$varname} = $trans->create_var
+	  ($type[0] || '', undef, varname => $varname);
 	'my $' . $varname;
       } else {
 	# _ は？ entity 自体に処理させるか…
@@ -1297,7 +1625,25 @@ sub feed_arg_spec {
     };
 
     my $fmt = q{foreach %1$s (%2$s) %3$s};
-    my $listexpr = $trans->genexpr_node($scope, 0, $args->adopter_for($list));
+    my $listexpr = do {
+      if (0) {
+	print STDERR "# foreach list: "
+	  , YATT::LRXML::Node::stringify_node($list), "\n";
+      }
+      # XXX: 何故使い分けが必要になってしまうのか?
+      # my $fc = $args->adopter_for($list);
+      # my $fc = $trans->fake_cursor_from($args, $list);
+      if (my $var = $trans->has_pass_through_var
+	  ($scope, my $fc = $trans->fake_cursor_from($args, $list), 'list')) {
+	unless ($var->type_name eq 'list') {
+	  my $path = $args->parent->node_path;
+	  die $trans->node_error($fc, "$path - should be list type")
+	}
+	'@'.$var->as_lvalue;
+      } else {
+	$trans->genexpr_node($scope, 0, $args->adopter_for($list));
+      }
+    };
     my @statements = $trans->as_statement_list
       ($trans->generate_body([\%local, $scope], $args));
 
@@ -1393,9 +1739,8 @@ sub feed_arg_spec {
     my $filename = $args->metainfo->filename;
     for (; $args->readable; $args->next) {
       last unless $args->is_primary_attribute;
-      my ($typename, $name)
-	= $trans->arg_type_and_name($args
-				    , $args->next_is_body ? 'html' : 'text');
+      my ($name, $typename) = $trans->arg_name_types($args);
+      $typename ||= $args->next_is_body ? 'html' : 'text';
       if (my VarType $old = $scope->[0]{$name}) {
 	die $trans->node_error
 	  ($args, "Variable '%s' redefined (previously at file %s line %s)"
@@ -1403,7 +1748,8 @@ sub feed_arg_spec {
 	   , $old->{cf_linenum} || '(unknown)');
       }
       my $var = $scope->[0]{$name}
-	= $trans->create_var($typename, undef, varname => $name
+	= $trans->create_var($typename, $args
+			     , varname => $name
 			     , filename => $filename
 			     , linenum  => $args->linenum);
 
@@ -1428,6 +1774,86 @@ sub feed_arg_spec {
   }
 }
 
+{
+  declare_alias macro_yatt_format => \&macro_format;
+  sub macro_format {
+    (my MY $trans, my ($scope, $args)) = @_;
+
+    unless ($args->readable && $args->is_primary_attribute) {
+      die $trans->node_error($args, "format parameter is missing");
+    }
+
+    my $name = $args->node_name;
+
+    my $format = do {
+      if (my $var = $trans->has_pass_through_var($scope, $args, $name)) {
+	$var->as_lvalue;
+      } else {
+	$trans->faked_gentype(text => $scope, $args);
+      }
+    };
+
+    $args->next;
+
+    sprintf(q|sprintf(%s, %s)|
+	    , $format
+	    , $trans->as_join($trans->generate_body([{}, $scope], $args)));
+  }
+}
+
+sub macro_dbfetch {
+  require YATT::Translator::Perl::macro_dbfetch;
+  shift->YATT::Translator::Perl::macro_dbfetch::macro(@_);
+}
+
+sub feed_arg_or_make_hash_of {
+  (my $trans
+   , my ($type, $scope, $args, $arg_dict, $arg_order)) = splice @_, 0, 6;
+  my (@primary, @secondary);
+  for (my $nth = 0; $args->readable; $args->next) {
+    last unless $args->is_primary_attribute;
+    my ($name, @ext) = $args->node_path;
+    unless (defined $name) {
+      $name = $arg_order->[$nth++]
+	or die $trans->node_error($args, "Too many args");
+    }
+    if ($name =~ /^-(.*)/) {
+      # XXX: そもそも -name=[...] で構造化したかった
+      push @secondary, [$name, $trans->faked_gentype
+			($type => $scope, $args, $args->current)];
+      next;
+    }
+    defined (my $argno = $arg_dict->{$name}) or do {
+      push @primary, [$name, $trans->faked_gentype
+			($type => $scope, $args, $args->current)];
+      next;
+    };
+
+    $_[$argno] = $args->current;
+  }
+  grep {@$_ ? $_ : ()} (\@primary, \@secondary);
+}
+
+#========================================
+sub entmacro_if {
+  my ($this, $trans
+      , $scope, $node, $restExpr, $queue, @args) = @_;
+  # XXX: $cond を文字列にするのは不便。
+  my ($cond, $then, $else)
+    = $trans->gen_entref_list($scope, $node, @args);
+  # XXX: 三項演算だと、狂いが出そうな。
+  sprintf q{((%s) ? %s : %s)}
+    , map {ref $_ ? $$_ : $_} $cond, $then, $else || q{''};
+};
+
+sub entmacro_render {
+  my ($this, $trans
+      , $scope, $node, $restExpr, $queue, @args) = @_;
+  my ($type, @expr)
+    = $trans->gen_entref_list($scope, $node, @args);
+  \ sprintf q{__PACKAGE__->can('render_'.%s)->($this, [%s])}
+    , $type, join(", ", @expr);
+};
 #========================================
 
 sub paren_escape ($) {
