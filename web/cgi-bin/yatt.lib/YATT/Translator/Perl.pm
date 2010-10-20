@@ -236,10 +236,13 @@ sub generate_template {
       \%calling_conv;
     }
   };
+  my @script;
+  foreach my $widget (@{$tmpl->widget_list}) {
+    push @script, $gen->generate_widget($widget, $metainfo, \@file_scope);
+  }
   join("", q{package } . $gen->get_package($tmpl) . ';'
        , join("",@use)
-       , map {$gen->generate_widget($_, $metainfo, \@file_scope)}
-       @{$tmpl->widget_list});
+       , @script);
 }
 
 sub generate_lineinfo {
@@ -706,8 +709,10 @@ sub genargs_static {
 	$argdecl->early_escaped ? $var->as_escaped : $var->as_lvalue;
       } elsif (defined $args->node_body) {
 	$argdecl->gen_assignable_node($trans, $scope, $args);
-      } else {
+      } elsif ($argdecl->isa($trans->t_scalar)) {
 	$argdecl->quote_assignable(my $copy = 1);
+      } else {
+	die $trans->node_error($args, "valueless arg '%s'", $name);
       }
     };
   }
@@ -816,6 +821,11 @@ sub attr_declare_delegate {
   }
   if ($tmpl->{cf_nsid} != $base->template_nsid) {
     $trans->mark_delayed_target($base);
+  }
+
+  if ($base->{arg_dict}{$argname}) {
+    die $trans->node_error($args, q{delegate '%1$s' hides argument '%1$s' of widget %2$s}
+			   , $argname, join(":", @elempath));
   }
 
   # pass thru する変数名の一覧。
@@ -1057,10 +1067,12 @@ sub gen_entref_path {
       my $call = do {
 	# XXX: codevar は、path の先頭だけ。
 	# 引数にも現れるから、
-	if ($var = $trans->find_var($scope, $name)) {
-	  if (ref $var and $var->can('arg_specs')) {
-	    sprintf('%1$s && %1$s->', $var->as_lvalue);
-	  } elsif (my $handler = $var->can("entmacro_")) {
+	if ($pkg->can(my $en = "entity_$name")) {
+	  sprintf('%s->%s', $pkg, $en);
+	} elsif ($var = $trans->find_codearg($scope, $name)) {
+	  sprintf('%1$s && %1$s->', $var->as_lvalue);
+	} elsif ($var = $trans->find_var($scope, $name)) {
+	  if (my $handler = $var->can("entmacro_")) {
             $dont_call++;
 	    $handler->($var, $trans, $scope, $node, \@_, [], @args);
 	  } else {
@@ -1074,15 +1086,13 @@ sub gen_entref_path {
 	  # 予約語も持ちたい。
           $dont_call++;
 	  $handler->($pkg, $trans, $scope, $node, \@_, [], @args);
-	} elsif ($pkg->can(my $en = "entity_$name")) {
-	  sprintf('%s->%s', $pkg, $en);
 	} else {
 	  die $trans->node_error($node, "not implemented call '%s' in %s"
 				 , $name, $node->node_body);
 	}
       };
 
-      ($dont_call || ref $call) ? $call : sprintf q{%s(%s)}, $call, join ", "
+      ($dont_call || ref $call) ? $call : sprintf q{(%s(%s))}, $call, join ", "
 	, $trans->gen_entref_list($scope, $node, @args);
     } elsif (($name) = $trans->feed_array_if(var => \@_)) {
       unless ($var = $trans->find_var($scope, $name)) {
@@ -1328,7 +1338,7 @@ use YATT::ArgTypes
    , -type_fmt => join("::", MY, 't_%s')
    , [text => -alias => '']
    , [html => \ lvalue_format => '$html_%s', \ early_escaped => 1]
-   , [scalar => -alias => 'value']
+   , [scalar => -alias => ['value', 'flag']]
    , ['list']
    , [attr => -base => 'text']
    , [code   => -alias => 'expr', \ can_call => 1
@@ -1458,6 +1468,7 @@ sub YATT::Translator::Perl::t_code::gen_call {
   (my t_code $argdecl, my MY $trans, my ($scope, $node)) = @_;
   my ($post, @args) = $trans->genargs_static
     ($scope, $node->open, $argdecl->arg_specs);
+  # XXX: こっちを () しなくて済むのはなぜ? => <yatt:tag/> の call だから?
   return \ sprintf '%1$s && %1$s->(%2$s)%3$s', $argdecl->as_lvalue
     , join(", ", @args), $post;
 }
