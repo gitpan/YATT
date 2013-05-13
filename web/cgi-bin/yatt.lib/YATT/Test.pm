@@ -3,6 +3,7 @@ package YATT::Test;
 use strict;
 use warnings FATAL => qw(all);
 use base qw(Test::More);
+BEGIN {$INC{'YATT/Test.pm'} = __FILE__}
 
 use File::Basename;
 use Cwd;
@@ -89,15 +90,15 @@ sub is_rendered ($$$) {
   };
   Test::More::is $error, undef, "$title - compiled.";
   eval {
-    if (!$error && $sub) {
+    if ($sub) {
       my $out = capture {
 	&YATT::break_handler;
 	$sub->($pkg, @args);
       };
       $out =~ s{\r}{}g if defined $out;
       eq_or_diff($out, $cmp, $title);
-    } else {
-      Test::More::fail "skipped. $title";
+    } elsif ($error) {
+      Test::More::fail "skipped, because of previous compile error for [$title]: $error";
     }
   };
   if ($@) {
@@ -283,8 +284,8 @@ sub xhf_do_sections {
       );
 
     foreach my TestDesc $test (@test) {
-      my @widget_path = split /:/, $test->{cf_WIDGET} if $test->{cf_WIDGET};
-      my ($param) = map {ref $_ ? $_ : 'main'->checked_eval($_)}
+      my @widget_path; @widget_path = split /:/, $test->{cf_WIDGET} if $test->{cf_WIDGET};
+      my ($param); ($param) = map {ref $_ ? $_ : 'main'->checked_eval($_)}
 	$test->{cf_PARAM} if $test->{cf_PARAM};
 
     SKIP: {

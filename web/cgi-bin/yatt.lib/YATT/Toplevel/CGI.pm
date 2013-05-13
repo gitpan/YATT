@@ -3,7 +3,10 @@ package YATT::Toplevel::CGI;
 use strict;
 use warnings FATAL => qw(all);
 
-BEGIN {require Exporter; *import = \&Exporter::import}
+BEGIN {
+  require Exporter; *import = \&Exporter::import;
+  $INC{'YATT/Toplevel/CGI.pm'} = __FILE__;
+}
 
 use base qw(File::Spec);
 use File::Basename;
@@ -208,7 +211,9 @@ END
     }
   }
 
-  $cgi->charset($config->{cf_charset} || 'utf-8');
+  if (my $sub = $cgi->can('charset')) {
+    $sub->($cgi, $config->{cf_charset} || 'utf-8');
+  }
 
   my $instpkg = $pack->get_instpkg($config);
 
@@ -660,10 +665,12 @@ sub new_translator {
 }
 
 sub use_env_vars {
+  my ($env) = @_;
+  $env //= \%ENV;
   foreach my $vn (our @env_vars) {
     *{globref(MY, $vn)} = do {
-      $ENV{$vn} = '' unless defined $ENV{$vn};
-      \ $ENV{$vn};
+      $env->{$vn} = '' unless defined $env->{$vn};
+      \ $env->{$vn};
     };
   }
   $SCRIPT_FILENAME ||= $0;
